@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>LuxTurma · Luminosidade</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, push, onValue, remove, set, update } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBzL_Pic_2JETKOqs4tD9EC2TRynEFaZG4",
+  authDomain: "som-ambiental.firebaseapp.com",
+  databaseURL: "https://som-ambiental-default-rtdb.firebaseio.com",
+  projectId: "som-ambiental",
+  storageBucket: "som-ambiental.firebasestorage.app",
+  messagingSenderId: "1008024969251",
+  appId: "1:1008024969251:web:c40b04fbe48dd578a05196"
+};
+
+// ── SENHA DO PROFESSOR ────────────────────────────────────────────────────────
+const PROF_PASSWORD = "SOBREIRA2026";
+// ─────────────────────────────────────────────────────────────────────────────
+
+const app = initializeApp(firebaseConfig);
+const db  = getDatabase(app);
+
+// Firebase helpers (com keys reais)
+function fbPush(path, data) { return push(ref(db, path), data); }
+function fbSet(path, data)  { return set(ref(db, path), data); }
+function fbUpdate(path, data) { return update(ref(db, path), data); }
+function fbRemove(path)     { return remove(ref(db, path)); }
+function fbOn(path, cb) {
+  onValue(ref(db, path), snap => cb(snap.val()));
+}
+function fbOnList(path, cb) {
+  onValue(ref(db, path), snap => {
+    const v = snap.val();
+    cb(v ? Object.entries(v).map(([k,d])=>({...d, _key:k})) : []);
+  });
+}
+
+// ── Câmera ────────────────────────────────────────────────────────────────────
+let videoStream = null, brightnessInterval = null, lastBrightness = null;
+const camCanvas = document.createElement('canvas');
+const camCtx    = camCanvas.getContext('2d');
+
+async function startCamera() {
+  try {
+    videoStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode:'environment', width:{ideal:320}, height:{ideal:240} }
+    });
+    $('cam-video').srcObject = videoStream;
+    await $('cam-video').play();
+    camCanvas.width=80; camCanvas.height=60;
+    brightnessInterval = setInterval(readBrightness, 200);
+    $('cam-status').textContent = '🟢 Câmera ativa — aponte para o ambiente';
+    $('cam-status').style.color = '#059669';
+    $('btn-capture').disabled = false;
+  } catch(e) {
+    $('cam-status').textContent = '❌ Câmera negada — insira o valor manualmente';
+    $('cam-status').style.color = '#dc2626';
+    show('manual-wrap');
+    $('btn-capture').disabled = false;
+  }
+}
+
+function stopCamera() {
+  clearInterval(brightnessInterval);
+  if (videoStream) { videoStream.getTracks().forEach(t=>t.stop()); videoStream=null; }
+  lastBrightness = null;
+}
+
+function readBrightness() {
+  const v = $('cam-video');
+  if (!v || v.readyState < 2) return;
+  camCtx.drawImage(v, 0, 0, camCanvas.width, camCanvas.height);
+  const data = camCtx.getImageData(0,0,camCanvas.width,camCanvas.height).data;
+  let sum = 0;
+  for (let i=0; i<data.length; i+=4)
+    sum += 0.2126*data[i] + 0.7152*data[i+1] + 0.0722*data[i+2];
+  lastBrightness = +(sum/(data.length/4)/255*100).toFixed(1);
+  updateBrightnessUI(lastBrightness);
+}
+
+function updateBrightnessUI(b) {
+  const cl = classify(b);
+  $('lux-value').textContent = b.toFixed(1);
+  $('lux-class').textContent = cl.emoji+' '+cl.label;
+  $('lux-class').style.color = cl.color;
+  $('lux-bar').style.width = b+'%';
+  $('lux-bar').style.background = cl.color;
+}
+
+function classify(b) {
+  if(b<5)  return {label:'Escuridão quase total',    emoji:'🌑', color:'#312e81'};
+  if(b<20) return {label:'Sombra densa',             emoji:'🌿', color:'#065f46'};
+  if(b<45) return {label:'Sombra moderada',          emoji:'⛅', color:'#92400e'};
+  if(b<70) return {label:'Luz ambiente difusa',      emoji:'🌤', color:'#b45309'};
+  if(b<88) return {label:'Luz intensa',              emoji:'🌞', color:'#dc2626'};
+  return          {label:'Pleno sol',                emoji:'🔆', color:'#7c2d12'};
+}
+
+// ── Estado ────────────────────────────────────────────────────────────────────
+let session='', role='', myName='', myToken='';
+let readings=[], liveChart=null, charts={};
+
+const $  = id => document.getElementById(id);
+const ALL_SCREENS = ['screen-home','screen-onboard','screen-student',
+                     'screen-professor','screen-analysis','screen-prof-login'];
+
+function show(id) {
+  if (ALL_SCREENS.includes(id)) {
+    ALL_SCREENS.forEach(s=>{const e=$(s);if(e){e.style.display='none';}});
+    const e=$(id); if(e) e.style.display='flex';
+  } else { const e=$(id); if(e) e.classList.remove('hidden'); }
+}
+function hide(id) {
+  if (ALL_SCREENS.includes(id)) { const e=$(id); if(e) e.style.display='none'; }
+  else { const e=$(id); if(e) e.classList.add('hidden'); }
+}
+
+function fmtDate(ts) {
+  const d=new Date(ts);
+  return d.toLocaleDateString('pt-BR')+' '+d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+}
+
+// ── Navegação ─────────────────────────────────────────────────────────────────
+window.goHome = () => { stopCamera(); show('screen-home'); };
+window.goOnboard = () => show('screen-onboard');
+window.goHomeFrOnboard = () => show('screen-home');
+
+window.enterStudent = async () => {
+  session = $('home-session').value.trim().toUpperCase();
+  if (!session) { alert('Digite o código da sessão!'); return; }
+  role = 'student';
+  // gera token único para este aluno nesta sessão
+  myToken = 'stu_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+  show('screen-student');
+  $('stu-session').textContent = session;
+  $('btn-capture').disabled = true;
+  fbOn('meta/'+session, d => {
+    if (d && d.label) $('stu-context').textContent = '📋 '+d.label;
+  });
+  fbOnList('lux/'+session, data => { readings = data; renderMyReadings(); });
+  await startCamera();
+};
+
+window.showProfLogin = () => {
+  session = $('home-session').value.trim().toUpperCase();
+  if (!session) { alert('Digite o código da sessão!'); return; }
+  show('screen-prof-login');
+  $('prof-login-session').textContent = session;
+  $('prof-pwd').value = '';
+  $('prof-pwd-err').textContent = '';
+};
+
+window.confirmProfLogin = () => {
+  const pwd = $('prof-pwd').value.trim();
+  if (pwd !== PROF_PASSWORD) {
+    $('prof-pwd-err').textContent = '❌ Senha incorreta. Tente novamente.';
+    return;
+  }
+  role = 'professor';
+  show('screen-professor');
+  $('prof-session').textContent = session;
+  startProfDashboard();
+};
+
+// ── ALUNO: enviar ─────────────────────────────────────────────────────────────
+window.captureAndSend = () => {
+  let b = lastBrightness;
+  const manual = parseFloat($('manual-input').value);
+  if (!isNaN(manual) && manual>=0 && manual<=100) b = manual;
+  if (b===null||b===undefined) { alert('Aguarde a câmera ou insira valor manual.'); return; }
+
+  myName = $('stu-name').value.trim() || 'Anônimo';
+  const local = $('stu-local').value.trim() || 'Não informado';
+  fbPush('lux/'+session, {b, name:myName, local, ts:Date.now(), token:myToken});
+
+  const cl = classify(b);
+  $('send-feedback').innerHTML = `✅ Enviado! <strong>${b.toFixed(1)}</strong> — ${cl.emoji} ${cl.label}`;
+  $('send-feedback').style.color = cl.color;
+  $('manual-input').value = '';
+  setTimeout(()=>$('send-feedback').innerHTML='', 3000);
+};
+
+// ── ALUNO: ver / editar / apagar os próprios dados ───────────────────────────
+function renderMyReadings() {
+  const mine = readings.filter(r => r.token === myToken);
+  const el = $('my-readings');
+  if (!mine.length) { el.innerHTML='<p class="no-data">Nenhum dado enviado ainda.</p>'; return; }
+  el.innerHTML = mine.map(r => {
+    const cl = classify(r.b);
+    return `<div class="my-row" id="row-${r._key}">
+      <div class="my-row-top">
+        <span>${cl.emoji}</span>
+        <span class="my-val" style="color:${cl.color}">${r.b.toFixed(1)}</span>
+        <span class="my-local">${r.local}</span>
+        <span class="my-date">${fmtDate(r.ts)}</span>
+      </div>
+      <div class="my-row-actions">
+        <button class="btn-edit-row" onclick="editReading('${r._key}','${r.local}')">✏️ Editar local</button>
+        <button class="btn-del-row"  onclick="deleteMyReading('${r._key}')">🗑 Apagar</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+window.editReading = (key, currentLocal) => {
+  const newLocal = prompt('Novo nome do local:', currentLocal);
+  if (newLocal===null) return;
+  fbUpdate('lux/'+session+'/'+key, {local: newLocal.trim()||'Não informado'});
+};
+
+window.deleteMyReading = key => {
+  if (!confirm('Apagar este dado?')) return;
+  fbRemove('lux/'+session+'/'+key);
+};
+
+// ── PROFESSOR: dashboard ──────────────────────────────────────────────────────
+function startProfDashboard() {
+  fbOnList('lux/'+session, data => { readings=data; refreshProf(); });
+  fbOn('meta/'+session, d => {
+    if(d){
+      if(d.label) $('prof-label').value=d.label;
+    }
+  });
+}
+
+window.setLabel = () => {
+  const lbl = $('prof-label').value.trim();
+  if(lbl) fbSet('meta/'+session, {label:lbl, updatedAt:Date.now()});
+};
+
+window.clearAll = () => {
+  if (!confirm('Apagar TODOS os dados desta sessão?')) return;
+  fbRemove('lux/'+session); readings=[]; refreshProf();
+};
+
+window.deleteOneReading = key => {
+  if (!confirm('Apagar este dado?')) return;
+  fbRemove('lux/'+session+'/'+key);
+};
+
+window.goAnalysis = () => {
+  if (readings.length<3) { alert('Precisa de pelo menos 3 leituras!'); return; }
+  show('screen-analysis');
+  buildAnalysis();
+};
+
+function refreshProf() {
+  const n=readings.length;
+  $('prof-n').textContent=n;
+  if(!n){ clearLiveChart(); return; }
+  const arr=readings.map(r=>r.b);
+  $('prof-mean').textContent   = mean(arr).toFixed(1);
+  $('prof-median').textContent = median(arr).toFixed(1);
+  $('prof-sd').textContent     = n>1?sd(arr).toFixed(1):'—';
+  drawLiveChart(arr);
+
+  // lista completa com delete
+  const sorted=[...readings].sort((a,b)=>b.ts-a.ts);
+  $('live-list').innerHTML = sorted.map(r => {
+    const cl=classify(r.b);
+    return `<div class="entry-row">
+      <span>${cl.emoji}</span>
+      <span class="e-name">${r.name}</span>
+      <span class="e-local">${r.local}</span>
+      <span class="e-val" style="color:${cl.color}">${r.b.toFixed(1)}</span>
+      <button class="btn-del-tiny" onclick="deleteOneReading('${r._key}')" title="Apagar">✕</button>
+    </div>`;
+  }).join('');
+
+  // resumo de ambientes
+  const lgs={};
+  readings.forEach(r=>{ if(!lgs[r.local])lgs[r.local]=0; lgs[r.local]++; });
+  $('env-summary').innerHTML = Object.entries(lgs)
+    .sort((a,b)=>b[1]-a[1])
+    .map(([l,c])=>`<span class="env-pill">${l} <strong>${c}</strong></span>`).join('');
+}
+
+function clearLiveChart() {
+  if(liveChart){liveChart.destroy();liveChart=null;}
+  ['prof-mean','prof-median','prof-sd'].forEach(id=>$(id).textContent='—');
+  $('live-list').innerHTML='';
+  $('env-summary').innerHTML='';
+}
+
+function drawLiveChart(arr) {
+  const {labels,counts}=histBins(arr,8);
+  const c=$('live-chart').getContext('2d');
+  if(liveChart) liveChart.destroy();
+  liveChart=new Chart(c,{type:'bar',
+    data:{labels,datasets:[{data:counts,
+      backgroundColor:counts.map((_,i)=>`hsla(${35+i*18},85%,52%,0.85)`),
+      borderRadius:6,borderWidth:0}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{y:{beginAtZero:true,ticks:{stepSize:1}},
+              x:{title:{display:true,text:'Brilho (0–100)'}}}}});
+}
+
+// ── Estatísticas ──────────────────────────────────────────────────────────────
+const mean   = a=>a.reduce((s,x)=>s+x,0)/a.length;
+const sd     = a=>{const m=mean(a);return Math.sqrt(a.reduce((s,x)=>s+(x-m)**2,0)/(a.length-1));};
+const median = a=>{const s=[...a].sort((x,y)=>x-y);return a.length%2?s[~~(a.length/2)]:(s[a.length/2-1]+s[a.length/2])/2;};
+const q1     = a=>{const s=[...a].sort((x,y)=>x-y);return median(s.slice(0,~~(s.length/2)));};
+const q3     = a=>{const s=[...a].sort((x,y)=>x-y);return median(s.slice(Math.ceil(s.length/2)));};
+const cv     = a=>sd(a)/mean(a)*100;
+
+function histBins(arr,bins=8){
+  const mn=Math.min(...arr),mx=Math.max(...arr),w=(mx-mn)/bins||1;
+  const counts=Array(bins).fill(0),labels=[];
+  for(let i=0;i<bins;i++) labels.push((mn+i*w).toFixed(1));
+  arr.forEach(v=>{const b=Math.min(~~((v-mn)/w),bins-1);counts[b]++;});
+  return{labels,counts};
+}
+
+// p-value math
+const ncdf=z=>{const t=1/(1+0.2316419*Math.abs(z)),d=0.3989422826*Math.exp(-z*z/2),
+  p=d*t*(0.3193815+t*(-0.3565638+t*(1.7814779+t*(-1.8212560+t*1.3302744))));return z>0?1-p:p;};
+const nq=p=>{if(p<=0)return -6;if(p>=1)return 6;
+  const a=[-39.6968,220.946,-275.928,138.358,-30.6648,2.50663];
+  const b=[-54.4760,161.586,-155.699,66.8013,-13.2806];
+  const c=[-0.00778,-0.32240,-2.40075,-2.54973,4.37475,2.93816];
+  const d2=[0.00778,0.32247,2.44514,3.75412];
+  if(p<0.02425){const q=Math.sqrt(-2*Math.log(p));return(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/(((d2[0]*q+d2[1])*q+d2[2])*q+d2[3]);}
+  const q=p-0.5,r=q*q;
+  return(((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q/(((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1);};
+const lg=x=>{const c=[76.180,-86.505,24.014,-1.2317,0.001208,-0.0000054];let y=x,s=1.0000000002,t=x+5.5;
+  t-=(x+0.5)*Math.log(t);for(let j=0;j<6;j++)s+=c[j]/++y;return -t+Math.log(2.5066*s/x);};
+const ib=(x,a,b)=>{if(x<=0)return 0;if(x>=1)return 1;
+  const lb=lg(a)+lg(b)-lg(a+b),fr=Math.exp(a*Math.log(x)+b*Math.log(1-x)-lb)/a;
+  let h=1,qab=a+b,qap=a+1,qam=a-1,cc=1,d=1-qab*x/qap;
+  if(Math.abs(d)<1e-30)d=1e-30;d=1/d;h=d;
+  for(let m=1;m<=200;m++){const m2=2*m;
+    let aa=m*(b-m)*x/((qam+m2)*(a+m2));d=1+aa*d;if(Math.abs(d)<1e-30)d=1e-30;
+    cc=1+aa/cc;if(Math.abs(cc)<1e-30)cc=1e-30;d=1/d;h*=d*cc;
+    aa=-(a+m)*(qab+m)*x/((a+m2)*(qap+m2));d=1+aa*d;if(Math.abs(d)<1e-30)d=1e-30;
+    cc=1+aa/cc;if(Math.abs(cc)<1e-30)cc=1e-30;d=1/d;const dl=d*cc;h*=dl;if(Math.abs(dl-1)<3e-7)break;}
+  return fr*h;};
+const tcdf=(t,df)=>1-0.5*ib(df/(df+t*t),df/2,0.5);
+const fcdf=(f,d1,d2)=>ib(d1*f/(d1*f+d2),d1/2,d2/2);
+
+function shapiroWilk(arr){
+  const n=arr.length;if(n<3)return{W:null,p:null};
+  const s=[...arr].sort((a,b)=>a-b),m=mean(s),_sd=sd(s);
+  const z=s.map(x=>(x-m)/_sd);
+  const qq=z.map((_,i)=>nq((i+1-0.375)/(n+0.25)));
+  const num=z.reduce((a,x,i)=>a+x*qq[i],0);
+  const W=(num/Math.sqrt(z.reduce((a,x)=>a+x*x,0)*qq.reduce((a,x)=>a+x*x,0)))**2;
+  const y=Math.log(1-W),mu=-1.2725+1.0521*Math.log(n),sig=Math.exp(-0.185-0.3437*Math.log(n));
+  const p=1-ncdf((y-mu)/sig);
+  return{W:+W.toFixed(4),p:+Math.max(0.0001,Math.min(0.9999,p)).toFixed(4)};
+}
+function tTest1(arr,mu0=0){const n=arr.length,m=mean(arr),s=sd(arr),t=(m-mu0)/(s/Math.sqrt(n));
+  return{t:+t.toFixed(4),df:n-1,p:+2*(1-tcdf(Math.abs(t),n-1)).toFixed(4)};}
+function mannWhitney(a,b){
+  const all=[...a.map(v=>({v,g:0})),...b.map(v=>({v,g:1}))].sort((x,y)=>x.v-y.v);
+  all.forEach((x,i)=>x.r=i+1);let i=0;
+  while(i<all.length){let j=i;while(j<all.length&&all[j].v===all[i].v)j++;
+    const r=(all[i].r+all[j-1].r)/2;for(let k=i;k<j;k++)all[k].r=r;i=j;}
+  const Ra=all.filter(x=>x.g===0).reduce((s,x)=>s+x.r,0),na=a.length,nb=b.length,U=Ra-na*(na+1)/2;
+  const z=(Math.min(U,na*nb-U)-na*nb/2)/Math.sqrt(na*nb*(na+nb+1)/12);
+  return{U:+Math.min(U,na*nb-U).toFixed(2),z:+z.toFixed(4),p:+2*(1-ncdf(Math.abs(z))).toFixed(4)};}
+function anova(gs){const all=gs.flat(),N=all.length,k=gs.length,grand=mean(all);
+  const SSB=gs.reduce((a,g)=>a+g.length*(mean(g)-grand)**2,0);
+  const SSW=gs.reduce((a,g)=>a+g.reduce((b,x)=>b+(x-mean(g))**2,0),0);
+  const F=(SSB/(k-1))/(SSW/(N-k));
+  return{F:+F.toFixed(4),dfB:k-1,dfW:N-k,p:+Math.max(0.0001,(1-fcdf(F,k-1,N-k))).toFixed(4)};}
+function pearson(x,y){const mx=mean(x),my=mean(y);
+  const r=x.reduce((a,xi,i)=>a+(xi-mx)*(y[i]-my),0)/
+    Math.sqrt(x.reduce((a,xi)=>a+(xi-mx)**2,0)*y.reduce((a,yi)=>a+(yi-my)**2,0));
+  const t=r*Math.sqrt((x.length-2)/(1-r*r));
+  return{r:+r.toFixed(4),p:+2*(1-tcdf(Math.abs(t),x.length-2)).toFixed(4)};}
+
+function pbadge(p){
+  if(p===null)return'<span class="badge grey">—</span>';
+  const sig=p<0.001?'***':p<0.01?'**':p<0.05?'*':'ns';
+  return`<span class="badge ${p<0.05?'sig':'ns'}">p=${p} ${sig}</span>`;}
+
+// ── Análise completa ──────────────────────────────────────────────────────────
+function destroyCharts(){Object.values(charts).forEach(c=>{try{c.destroy()}catch(e){}});charts={};}
+window.destroyCharts=destroyCharts;
+
+function buildAnalysis(){
+  destroyCharts();
+  const arr=readings.map(r=>r.b),n=arr.length;
+  const m=mean(arr),_sd=sd(arr),med=median(arr),_q1=q1(arr),_q3=q3(arr);
+
+  // 1. Descritiva
+  $('a-desc').innerHTML=`
+    <tr><td>n</td><td>${n}</td></tr>
+    <tr><td>Média</td><td>${m.toFixed(2)}</td></tr>
+    <tr><td>Mediana</td><td>${med.toFixed(2)}</td></tr>
+    <tr><td>DP</td><td>${_sd.toFixed(2)}</td></tr>
+    <tr><td>CV%</td><td>${cv(arr).toFixed(1)}%</td></tr>
+    <tr><td>Mín / Máx</td><td>${Math.min(...arr).toFixed(1)} / ${Math.max(...arr).toFixed(1)}</td></tr>
+    <tr><td>Q1 / Q3</td><td>${_q1.toFixed(2)} / ${_q3.toFixed(2)}</td></tr>
+    <tr><td>IQR</td><td>${(_q3-_q1).toFixed(2)}</td></tr>`;
+  const {labels,counts}=histBins(arr,10);
+  charts.hist=new Chart($('a-hist').getContext('2d'),{type:'bar',
+    data:{labels,datasets:[{data:counts,
+      backgroundColor:counts.map((_,i)=>`hsla(${30+i*16},80%,55%,0.85)`),borderRadius:8,borderWidth:0}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+      scales:{y:{beginAtZero:true},x:{title:{display:true,text:'Brilho (0–100)'}}}}});
+
+  // 2. Comparação de ambientes (principal!)
+  const lgs={};
+  readings.forEach((r,i)=>{if(!lgs[r.local])lgs[r.local]=[];lgs[r.local].push({idx:i,b:r.b});});
+  const lNames=Object.keys(lgs);
+  const pal=['#f59e0b','#3b82f6','#10b981','#ef4444','#8b5cf6','#ec4899','#06b6d4','#84cc16'];
+
+  // scatter por local
+  charts.scatter=new Chart($('a-scatter').getContext('2d'),{type:'scatter',
+    data:{datasets:lNames.map((l,i)=>({label:l,
+      data:lgs[l].map(p=>({x:p.idx+1,y:p.b})),
+      backgroundColor:pal[i%pal.length]+'bb',pointRadius:8}))},
+    options:{responsive:true,maintainAspectRatio:false,
+      scales:{x:{title:{display:true,text:'Ordem de coleta'}},y:{title:{display:true,text:'Brilho (0–100)'}}},
+      plugins:{legend:{position:'bottom',labels:{boxWidth:10,font:{size:10}}}}}});
+
+  if(lNames.length>=2){
+    const gs=lNames.map(l=>lgs[l].map(p=>p.b));
+    if(lNames.length===2&&gs[0].length>=2&&gs[1].length>=2){
+      const mw=mannWhitney(gs[0],gs[1]);
+      $('a-test').innerHTML=`
+        <tr><th colspan="2">Mann-Whitney U — ${lNames[0]} vs ${lNames[1]}</th></tr>
+        <tr><td>Média ${lNames[0]}</td><td>${mean(gs[0]).toFixed(2)}</td></tr>
+        <tr><td>Média ${lNames[1]}</td><td>${mean(gs[1]).toFixed(2)}</td></tr>
+        <tr><td>U</td><td>${mw.U}</td></tr><tr><td>z</td><td>${mw.z}</td></tr>
+        <tr><td>p-valor</td><td>${pbadge(mw.p)}</td></tr>
+        <tr><td>Conclusão</td><td>${mw.p<0.05?'✅ Ambientes diferem (p<0.05)':'⚪ Sem diferença significativa'}</td></tr>`;
+    } else if(lNames.length>=3&&gs.every(g=>g.length>=1)){
+      const av=anova(gs);
+      $('a-test').innerHTML=`
+        <tr><th colspan="2">ANOVA 1 fator — ${lNames.length} ambientes</th></tr>
+        <tr><td>F</td><td>${av.F}</td></tr>
+        <tr><td>df entre / dentro</td><td>${av.dfB} / ${av.dfW}</td></tr>
+        <tr><td>p-valor</td><td>${pbadge(av.p)}</td></tr>
+        <tr><td>Conclusão</td><td>${av.p<0.05?'✅ Ambientes diferem (p<0.05)':'⚪ Sem diferença significativa'}</td></tr>`;
+    } else {
+      $('a-test').innerHTML='<tr><td colspan="2">Precisa de ≥2 dados por local para comparação</td></tr>';
+    }
+    // bar chart médias
+    charts.bar=new Chart($('a-bar').getContext('2d'),{type:'bar',
+      data:{labels:lNames,datasets:[{
+        label:'Média',data:lNames.map(l=>mean(lgs[l].map(p=>p.b)).toFixed(2)),
+        backgroundColor:lNames.map((_,i)=>pal[i%pal.length]+'cc'),borderRadius:10}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+        scales:{y:{beginAtZero:false,title:{display:true,text:'Brilho médio (0–100)'}},
+                x:{ticks:{maxRotation:30}}}}});
+  } else {
+    $('a-test').innerHTML='<tr><td colspan="2">📌 Registre pelo menos 2 locais diferentes para comparação</td></tr>';
+  }
+
+  // 3. Normalidade
+  const sw=shapiroWilk(arr);
+  $('a-sw').innerHTML=sw.W
+    ?`<tr><td>W</td><td>${sw.W}</td></tr><tr><td>p-valor</td><td>${pbadge(sw.p)}</td></tr>
+      <tr><td>Distribuição</td><td>${sw.p>0.05?'✅ Normal (p>0.05)':'⚠️ Não-normal → use Mann-Whitney'}</td></tr>`
+    :'<tr><td colspan="2">n mínimo = 3</td></tr>';
+  const zs=[...arr].sort((a,b)=>a-b).map((v,i)=>({x:nq((i+1-0.375)/(n+0.25)),y:v}));
+  const xs=zs.map(p=>p.x);
+  const rb1=zs.reduce((a,p)=>a+p.x*p.y,0)/xs.reduce((a,x)=>a+x*x,0);
+  const rb0=mean(zs.map(p=>p.y))-rb1*mean(xs);
+  charts.qq=new Chart($('a-qq').getContext('2d'),{type:'scatter',
+    data:{datasets:[{label:'Dados',data:zs,backgroundColor:'rgba(245,158,11,0.75)',pointRadius:5},
+      {label:'Normal',data:xs.map(x=>({x,y:rb0+rb1*x})),showLine:true,
+        borderColor:'#b45309',pointRadius:0,fill:false,backgroundColor:'transparent'}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+      scales:{x:{title:{display:true,text:'Quantis Teóricos'}},y:{title:{display:true,text:'Quantis Amostrais'}}}}});
+
+  // 4. Correlação
+  const tt=tTest1(arr);
+  const pc=arr.length>=4?pearson(arr.map((_,i)=>i+1),arr):null;
+  $('a-corr').innerHTML=`
+    <tr><th colspan="2">Teste t — média vs zero (μ₀=0)</th></tr>
+    <tr><td>t</td><td>${tt.t}</td></tr><tr><td>df</td><td>${tt.df}</td></tr>
+    <tr><td>p-valor</td><td>${pbadge(tt.p)}</td></tr>
+    ${pc?`<tr><th colspan="2" style="padding-top:10px">Pearson — brilho × ordem</th></tr>
+    <tr><td>r</td><td>${pc.r}</td></tr><tr><td>p-valor</td><td>${pbadge(pc.p)}</td></tr>
+    <tr><td>Força</td><td>${Math.abs(pc.r)>0.6?'Forte':Math.abs(pc.r)>0.3?'Moderada':'Fraca'}</td></tr>`:''}`;
+
+  // 5. Perfil ecológico
+  const cats={'Escuridão/Sombra densa':0,'Sombra moderada':0,'Luz difusa':0,'Luz intensa/Sol':0};
+  arr.forEach(v=>{
+    if(v<20)cats['Escuridão/Sombra densa']++;
+    else if(v<45)cats['Sombra moderada']++;
+    else if(v<70)cats['Luz difusa']++;
+    else cats['Luz intensa/Sol']++;
+  });
+  charts.eco=new Chart($('a-eco').getContext('2d'),{type:'doughnut',
+    data:{labels:Object.keys(cats),datasets:[{data:Object.values(cats),
+      backgroundColor:['#312e81','#065f46','#92400e','#dc2626'],borderWidth:2,borderColor:'#fff'}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{position:'bottom',labels:{font:{size:11}}}}}});
+  const cvVal=cv(arr);
+  $('eco-ctx').innerHTML=`
+    <strong>🌿 Interpretação:</strong> Brilho médio <strong>${m.toFixed(1)}/100</strong> → ${classify(m).emoji} ${classify(m).label}.
+    CV = ${cvVal.toFixed(0)}% → ${cvVal>60?'alta heterogeneidade de microambiente':cvVal>30?'variabilidade moderada':'ambiente homogêneo'}.
+    <br><br>
+    <strong>💡 Conexões biológicas:</strong> Plantas de sub-bosque adaptam-se a brilho &lt;30% com cloroplastos maiores.
+    Polinizadores detectam contrastes de luminosidade ≥20% entre flor e fundo.
+    Fotoperiodismo: limiares críticos de ~10–15% disparam respostas endócrinas em vertebrados.`;
+}
+
+window.addEventListener('DOMContentLoaded', ()=>{ show('screen-home'); });
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Syne:wght@700;800&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+:root{
+  --sun:#f59e0b;--green:#059669;--blue:#2563eb;--red:#dc2626;--purple:#7c3aed;
+  --bg:#fffdf5;--card:#fff;--border:#fde68a;--text:#1c1917;--muted:#78716c;--r:16px;
+}
+html,body{height:100%;background:var(--bg);font-family:'Nunito',sans-serif;color:var(--text);}
+.screen{display:none;min-height:100vh;flex-direction:column;width:100%;}
+.hidden{display:none!important;}
+
+/* TOP BAR */
+.topbar{background:linear-gradient(90deg,#f59e0b,#fbbf24);color:#fff;
+  padding:13px 18px;display:flex;align-items:center;gap:10px;
+  font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;
+  position:sticky;top:0;z-index:100;box-shadow:0 2px 12px rgba(245,158,11,.3);}
+.back{background:rgba(255,255,255,.25);border:none;color:#fff;
+  padding:6px 14px;border-radius:20px;cursor:pointer;font-size:.8rem;font-family:'Nunito',sans-serif;}
+.stag{margin-left:auto;background:rgba(255,255,255,.2);
+  padding:4px 12px;border-radius:20px;font-size:.72rem;letter-spacing:.04em;}
+
+/* ══ HOME ══ */
+#screen-home{background:linear-gradient(155deg,#fffdf5,#fef3c7 55%,#ecfdf5);
+  align-items:center;justify-content:center;padding:20px;}
+.home-sun{font-size:4rem;text-align:center;animation:bob 3s ease-in-out infinite;}
+@keyframes bob{0%,100%{transform:translateY(0) scale(1);}50%{transform:translateY(-6px) scale(1.06);}}
+.home-title{font-family:'Syne',sans-serif;font-size:1.9rem;font-weight:800;
+  color:#92400e;text-align:center;line-height:1.1;margin-top:4px;}
+.home-sub{color:var(--muted);font-size:.82rem;text-align:center;margin:6px 0 22px;line-height:1.5;}
+.home-card{background:var(--card);border-radius:20px;padding:24px;width:100%;max-width:380px;
+  border:2px solid var(--border);box-shadow:0 4px 28px rgba(245,158,11,.15);}
+.flabel{font-size:.72rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;}
+.finput{width:100%;margin:7px 0 16px;padding:13px 15px;border:2px solid #fde68a;
+  border-radius:10px;font-size:1.05rem;font-family:'Nunito',sans-serif;
+  text-transform:uppercase;letter-spacing:.12em;background:#fffbf0;}
+.finput:focus{outline:none;border-color:var(--sun);}
+.btn-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.btn-stu{background:var(--green);color:#fff;border:none;padding:14px;border-radius:10px;
+  font-size:.9rem;font-weight:800;cursor:pointer;font-family:'Nunito',sans-serif;}
+.btn-prof{background:var(--blue);color:#fff;border:none;padding:14px;border-radius:10px;
+  font-size:.9rem;font-weight:800;cursor:pointer;font-family:'Nunito',sans-serif;}
+.btn-how{width:100%;margin-top:10px;background:transparent;border:2px solid var(--border);
+  color:#92400e;padding:11px;border-radius:10px;font-weight:700;cursor:pointer;
+  font-family:'Nunito',sans-serif;font-size:.85rem;}
+
+/* ══ PROF LOGIN ══ */
+#screen-prof-login{background:linear-gradient(155deg,#eff6ff,#dbeafe);
+  align-items:center;justify-content:center;padding:24px;}
+.login-card{background:var(--card);border-radius:20px;padding:28px;width:100%;max-width:360px;
+  border:2px solid #bfdbfe;box-shadow:0 4px 24px rgba(37,99,235,.12);}
+.login-icon{font-size:3rem;text-align:center;margin-bottom:10px;}
+.login-title{font-family:'Syne',sans-serif;font-size:1.3rem;font-weight:800;
+  color:var(--blue);text-align:center;margin-bottom:4px;}
+.login-sub{font-size:.78rem;color:var(--muted);text-align:center;margin-bottom:20px;}
+.login-card label{font-size:.72rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;}
+.login-card input{width:100%;margin:7px 0 8px;padding:13px 15px;border:2px solid #bfdbfe;
+  border-radius:10px;font-size:1rem;font-family:'Nunito',sans-serif;background:#eff6ff;letter-spacing:.1em;}
+.login-card input:focus{outline:none;border-color:var(--blue);}
+#prof-pwd-err{font-size:.78rem;color:var(--red);min-height:20px;margin-bottom:10px;}
+.btn-login{width:100%;background:var(--blue);color:#fff;border:none;padding:14px;
+  border-radius:10px;font-size:1rem;font-weight:800;cursor:pointer;font-family:'Nunito',sans-serif;}
+.btn-cancel{width:100%;margin-top:8px;background:transparent;border:2px solid #bfdbfe;
+  color:var(--blue);padding:11px;border-radius:10px;font-weight:700;cursor:pointer;font-family:'Nunito',sans-serif;}
+
+/* ══ ONBOARDING ══ */
+#screen-onboard{background:linear-gradient(155deg,#fffdf5,#fef3c7);}
+#screen-onboard .topbar{background:linear-gradient(90deg,#92400e,#b45309);}
+.ob-body{padding:20px;display:flex;flex-direction:column;gap:14px;flex:1;}
+.ob-hero{text-align:center;padding:12px 0 4px;}
+.ob-hero .icon{font-size:3rem;}
+.ob-hero h2{font-family:'Syne',sans-serif;font-size:1.2rem;color:#92400e;margin-top:6px;}
+.ob-card{background:var(--card);border-radius:var(--r);border:2px solid var(--border);padding:16px;}
+.ob-card h3{font-family:'Syne',sans-serif;font-size:.88rem;color:#92400e;margin-bottom:10px;}
+.step{display:flex;gap:12px;align-items:flex-start;margin-bottom:10px;}
+.step:last-child{margin-bottom:0;}
+.step-num{min-width:26px;height:26px;background:var(--sun);color:#fff;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.82rem;flex-shrink:0;}
+.step p{font-size:.8rem;line-height:1.6;}
+.step p strong{color:#92400e;}
+.warn-box{background:#fef9c3;border:2px solid #fde68a;border-radius:12px;padding:13px;
+  font-size:.78rem;line-height:1.7;color:#78350f;}
+.warn-box strong{color:#92400e;display:block;margin-bottom:3px;}
+.eco-box{background:#ecfdf5;border:2px solid #a7f3d0;border-radius:12px;padding:13px;
+  font-size:.78rem;line-height:1.7;color:#065f46;}
+.eco-box strong{display:block;margin-bottom:3px;}
+.scale-row{display:flex;flex-direction:column;gap:6px;}
+.scale-item{display:flex;align-items:center;gap:10px;font-size:.78rem;}
+.scale-dot{width:11px;height:11px;border-radius:50%;flex-shrink:0;}
+
+/* ══ STUDENT ══ */
+#screen-student .topbar{background:linear-gradient(90deg,#059669,#34d399);}
+.stu-body{padding:16px;display:flex;flex-direction:column;gap:13px;flex:1;
+  background:linear-gradient(180deg,#ecfdf5,#fffdf5);}
+.ctx-tag{text-align:center;font-size:.78rem;color:var(--muted);min-height:18px;}
+
+/* camera */
+.cam-card{background:var(--card);border-radius:var(--r);border:2px solid #a7f3d0;overflow:hidden;}
+.cam-preview{background:#000;height:120px;display:flex;align-items:center;justify-content:center;position:relative;}
+#cam-video{width:100%;height:120px;object-fit:cover;display:block;}
+.cam-overlay{position:absolute;top:6px;right:8px;background:rgba(0,0,0,.5);
+  color:#fff;font-size:.68rem;padding:3px 8px;border-radius:10px;}
+.lux-display{padding:14px 16px;text-align:center;}
+.lux-num{font-family:'Syne',sans-serif;font-size:2.8rem;font-weight:800;color:#065f46;line-height:1;}
+.lux-label{font-size:.95rem;font-weight:700;margin-top:4px;}
+.bar-wrap{background:#d1fae5;border-radius:20px;height:10px;margin:10px 0 4px;overflow:hidden;}
+.bar-fill{height:100%;border-radius:20px;transition:width .3s,background .3s;width:0;}
+.cam-status{font-size:.72rem;color:var(--muted);padding:0 16px 12px;text-align:center;}
+
+.form-card{background:var(--card);border-radius:var(--r);border:2px solid var(--border);padding:16px;}
+.form-card label{display:block;font-size:.72rem;font-weight:700;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;}
+.form-card input{width:100%;padding:11px 13px;border:2px solid #fde68a;border-radius:9px;
+  font-size:.92rem;font-family:'Nunito',sans-serif;background:#fffbf0;margin-bottom:12px;}
+.form-card input:focus{outline:none;border-color:var(--sun);}
+.manual-box{background:#fef9c3;border-radius:10px;padding:12px;margin-bottom:12px;font-size:.75rem;color:#78350f;line-height:1.5;}
+.btn-capture{width:100%;background:linear-gradient(90deg,#f59e0b,#fbbf24);color:#fff;
+  border:none;padding:16px;border-radius:12px;font-size:1.05rem;font-weight:800;cursor:pointer;
+  font-family:'Syne',sans-serif;box-shadow:0 4px 14px rgba(245,158,11,.35);}
+.btn-capture:disabled{opacity:.45;cursor:not-allowed;}
+#send-feedback{text-align:center;font-size:.9rem;font-weight:700;min-height:22px;margin-top:6px;}
+
+/* meus dados */
+.my-readings-card{background:var(--card);border-radius:var(--r);border:2px solid var(--border);padding:16px;}
+.my-readings-title{font-family:'Syne',sans-serif;font-size:.88rem;font-weight:800;
+  color:#92400e;margin-bottom:12px;}
+.my-row{background:#fffbf0;border-radius:10px;border:1px solid #fde68a;padding:10px 12px;margin-bottom:8px;}
+.my-row:last-child{margin-bottom:0;}
+.my-row-top{display:flex;align-items:center;gap:8px;font-size:.82rem;}
+.my-val{font-family:'Syne',sans-serif;font-weight:800;font-size:.95rem;}
+.my-local{flex:1;color:var(--muted);font-size:.75rem;}
+.my-date{font-size:.68rem;color:#a8a29e;}
+.my-row-actions{display:flex;gap:8px;margin-top:8px;}
+.btn-edit-row{flex:1;background:#eff6ff;border:1px solid #bfdbfe;color:var(--blue);
+  padding:6px;border-radius:7px;cursor:pointer;font-size:.75rem;font-family:'Nunito',sans-serif;font-weight:700;}
+.btn-del-row{flex:1;background:#fff1f2;border:1px solid #fecdd3;color:var(--red);
+  padding:6px;border-radius:7px;cursor:pointer;font-size:.75rem;font-family:'Nunito',sans-serif;font-weight:700;}
+.no-data{font-size:.8rem;color:var(--muted);text-align:center;padding:10px 0;}
+
+/* ══ PROFESSOR ══ */
+#screen-professor .topbar{background:linear-gradient(90deg,#2563eb,#60a5fa);}
+.prof-body{padding:14px;display:flex;flex-direction:column;gap:12px;flex:1;}
+.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;}
+.sbox{background:var(--card);border-radius:12px;padding:10px 6px;text-align:center;border:2px solid var(--border);}
+.sbox .val{font-family:'Syne',sans-serif;font-size:1.2rem;font-weight:800;color:var(--blue);}
+.sbox .lbl{font-size:.6rem;color:var(--muted);text-transform:uppercase;margin-top:2px;}
+.chart-box{background:var(--card);border-radius:var(--r);border:2px solid var(--border);padding:12px;height:180px;position:relative;}
+.env-row{display:flex;flex-wrap:wrap;gap:6px;}
+.env-pill{background:#fef3c7;border:1px solid #fde68a;border-radius:20px;
+  padding:4px 10px;font-size:.75rem;color:#92400e;}
+.env-pill strong{color:#b45309;}
+.live-box{background:var(--card);border-radius:var(--r);border:2px solid var(--border);padding:12px;max-height:220px;overflow-y:auto;}
+.live-title{font-size:.72rem;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:8px;}
+.entry-row{display:flex;align-items:center;gap:7px;padding:5px 0;border-bottom:1px solid #fef9c3;font-size:.8rem;}
+.entry-row:last-child{border-bottom:none;}
+.e-name{font-weight:700;flex:1;}
+.e-local{color:var(--muted);font-size:.72rem;flex:1;}
+.e-val{font-family:'Syne',sans-serif;font-weight:800;font-size:.88rem;}
+.btn-del-tiny{background:#fff1f2;border:1px solid #fecdd3;color:var(--red);
+  padding:3px 7px;border-radius:6px;cursor:pointer;font-size:.72rem;flex-shrink:0;}
+.label-row{display:flex;gap:8px;}
+.label-row input{flex:1;padding:9px 13px;border:2px solid var(--border);
+  border-radius:8px;font-size:.88rem;font-family:'Nunito',sans-serif;background:#fffbf0;}
+.label-row input:focus{outline:none;border-color:var(--sun);}
+.label-row button{background:var(--sun);color:#fff;border:none;padding:9px 15px;
+  border-radius:8px;cursor:pointer;font-weight:700;font-family:'Nunito',sans-serif;}
+.act-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.btn-analyze{background:linear-gradient(90deg,#7c3aed,#a78bfa);color:#fff;border:none;
+  padding:13px;border-radius:10px;font-weight:800;cursor:pointer;font-family:'Syne',sans-serif;}
+.btn-clear{background:#fff;color:var(--red);border:2px solid #fca5a5;padding:13px;
+  border-radius:10px;font-weight:700;cursor:pointer;font-family:'Nunito',sans-serif;}
+
+/* ══ ANALYSIS ══ */
+#screen-analysis{overflow-y:auto;}
+#screen-analysis .topbar{background:linear-gradient(90deg,#7c3aed,#a78bfa);}
+.ana-body{padding:14px;display:flex;flex-direction:column;gap:16px;padding-bottom:40px;}
+.sec{background:var(--card);border-radius:var(--r);border:2px solid var(--border);padding:16px;}
+.sec-title{font-family:'Syne',sans-serif;font-size:.92rem;font-weight:800;color:#92400e;
+  margin-bottom:12px;padding-bottom:6px;border-bottom:2px solid #fde68a;}
+.ch{height:190px;position:relative;margin-top:12px;}
+.eco-ctx{background:#f0fdf4;border-radius:10px;padding:12px;font-size:.78rem;
+  line-height:1.8;color:#065f46;margin-top:10px;}
+table{width:100%;border-collapse:collapse;font-size:.8rem;}
+td,th{padding:7px 10px;border-bottom:1px solid #fef9c3;}
+th{background:#fffbf0;font-weight:700;}
+td:last-child{text-align:right;font-weight:600;}
+.badge{padding:3px 9px;border-radius:20px;font-size:.7rem;font-weight:700;}
+.badge.sig{background:#dcfce7;color:#15803d;}
+.badge.ns{background:#fef9c3;color:#854d0e;}
+.badge.grey{background:#f1f5f9;color:var(--muted);}
+</style>
+</head>
+<body>
+
+<!-- ══ HOME ══ -->
+<div id="screen-home" class="screen">
+  <div class="home-sun">☀️</div>
+  <div class="home-title">LuxTurma</div>
+  <div class="home-sub">Luminosidade colaborativa em tempo real · UNEMAT</div>
+  <div class="home-card">
+    <div class="flabel">Código da sessão</div>
+    <input class="finput" id="home-session" placeholder="Ex: BIO2026" maxlength="12">
+    <div class="btn-row">
+      <button class="btn-stu"  onclick="enterStudent()">🎓 Sou aluno</button>
+      <button class="btn-prof" onclick="showProfLogin()">🔐 Professor</button>
+    </div>
+    <button class="btn-how" onclick="goOnboard()">❓ Como funciona este app?</button>
+  </div>
+</div>
+
+<!-- ══ PROF LOGIN ══ -->
+<div id="screen-prof-login" class="screen">
+  <div class="login-card">
+    <div class="login-icon">🔐</div>
+    <div class="login-title">Acesso do Professor</div>
+    <div class="login-sub">Sessão: <strong id="prof-login-session">—</strong></div>
+    <label>Senha</label>
+    <input id="prof-pwd" type="password" placeholder="Digite a senha" autocomplete="off"
+      onkeydown="if(event.key==='Enter') confirmProfLogin()">
+    <div id="prof-pwd-err"></div>
+    <button class="btn-login"  onclick="confirmProfLogin()">Entrar →</button>
+    <button class="btn-cancel" onclick="goHome()">← Cancelar</button>
+  </div>
+</div>
+
+<!-- ══ ONBOARDING ══ -->
+<div id="screen-onboard" class="screen">
+  <div class="topbar">
+    <button class="back" onclick="goHomeFrOnboard()">← Voltar</button>
+    Como funciona
+  </div>
+  <div class="ob-body">
+    <div class="ob-hero"><div class="icon">📱💡</div>
+      <h2>Medindo luminosidade com o celular</h2></div>
+    <div class="ob-card">
+      <h3>🔬 O que o app mede</h3>
+      <p style="font-size:.8rem;line-height:1.7;">A <strong>câmera traseira</strong> captura o ambiente e calcula o <strong>brilho médio dos pixels</strong> (0–100). Quanto mais luz, maior o valor. É uma medida relativa de iluminância — equivalente funcional ao lux profissional.</p>
+    </div>
+    <div class="ob-card">
+      <h3>🎓 Passo a passo — Aluno</h3>
+      <div class="step"><div class="step-num">1</div><p>Digite o <strong>código da sessão</strong> e toque <em>Sou aluno</em>.</p></div>
+      <div class="step"><div class="step-num">2</div><p>Permita o acesso à câmera quando solicitado.</p></div>
+      <div class="step"><div class="step-num">3</div><p><strong>Aponte a câmera traseira</strong> para o local que deseja medir.</p></div>
+      <div class="step"><div class="step-num">4</div><p>Aguarde o valor estabilizar, preencha nome e <strong>local/microambiente</strong>.</p></div>
+      <div class="step"><div class="step-num">5</div><p>Toque <strong>Capturar & Enviar</strong>. Veja seus dados logo abaixo — pode editar o local ou apagar.</p></div>
+    </div>
+    <div class="warn-box">
+      <strong>⚠️ Se a câmera não funcionar</strong>
+      O campo manual aparece automaticamente. Use um app luxímetro (ex: "Lux Light Meter") e insira o valor convertido para 0–100.
+    </div>
+    <div class="ob-card">
+      <h3>📊 Escala de brilho (0–100)</h3>
+      <div class="scale-row">
+        <div class="scale-item"><div class="scale-dot" style="background:#312e81"></div><span><strong>0–5:</strong> Escuridão (noite, sala fechada)</span></div>
+        <div class="scale-item"><div class="scale-dot" style="background:#065f46"></div><span><strong>5–20:</strong> Sombra densa (sub-bosque)</span></div>
+        <div class="scale-item"><div class="scale-dot" style="background:#92400e"></div><span><strong>20–45:</strong> Sombra moderada / luz indireta</span></div>
+        <div class="scale-item"><div class="scale-dot" style="background:#b45309"></div><span><strong>45–70:</strong> Luz difusa (sala iluminada)</span></div>
+        <div class="scale-item"><div class="scale-dot" style="background:#dc2626"></div><span><strong>70–88:</strong> Luz intensa (beira de janela)</span></div>
+        <div class="scale-item"><div class="scale-dot" style="background:#7c2d12"></div><span><strong>88–100:</strong> Pleno sol direto</span></div>
+      </div>
+    </div>
+    <div class="eco-box">
+      <strong>🌿 Por que medir luminosidade em Biologia?</strong>
+      Gradientes de luminosidade determinam fotossíntese, fotoperiodismo e estrutura de comunidades. Medir esses gradientes com dados reais conecta teoria e campo.
+    </div>
+    <button class="btn-how" onclick="goHomeFrOnboard()">← Voltar e começar</button>
+  </div>
+</div>
+
+<!-- ══ STUDENT ══ -->
+<div id="screen-student" class="screen">
+  <div class="topbar" style="background:linear-gradient(90deg,#059669,#34d399);">
+    <button class="back" onclick="goHome()">← Sair</button>
+    💡 Medir Luminosidade
+    <span id="stu-session" class="stag">—</span>
+  </div>
+  <div class="stu-body">
+    <div class="ctx-tag" id="stu-context"></div>
+    <!-- câmera -->
+    <div class="cam-card">
+      <div class="cam-preview">
+        <video id="cam-video" autoplay playsinline muted></video>
+        <div class="cam-overlay">câmera ao vivo</div>
+      </div>
+      <div class="lux-display">
+        <div class="lux-num" id="lux-value">—</div>
+        <div style="font-size:.7rem;color:var(--muted)">brilho relativo (0–100)</div>
+        <div class="lux-label" id="lux-class">Aguardando câmera…</div>
+        <div class="bar-wrap"><div class="bar-fill" id="lux-bar"></div></div>
+      </div>
+      <div class="cam-status" id="cam-status">🔄 Solicitando câmera…</div>
+    </div>
+    <!-- form -->
+    <div class="form-card">
+      <label>Seu nome</label>
+      <input id="stu-name" placeholder="Nome ou apelido">
+      <label>Local / microambiente</label>
+      <input id="stu-local" placeholder="Ex: sob árvore, janela norte, bancada…">
+      <div class="manual-box hidden" id="manual-wrap">
+        <strong>📲 Câmera indisponível — insira manualmente (0–100)</strong><br>
+        Use um app luxímetro e converta para a escala 0–100.
+        <br><br>
+        <input id="manual-input" type="number" min="0" max="100" step="0.1" placeholder="Ex: 45.3"
+          style="width:100%;padding:10px;border:2px solid #fcd34d;border-radius:8px;
+          font-family:Nunito,sans-serif;background:#fffbf0;margin-top:6px;">
+      </div>
+      <button class="btn-capture" id="btn-capture" onclick="captureAndSend()">📤 Capturar &amp; Enviar</button>
+      <div id="send-feedback"></div>
+    </div>
+    <!-- meus dados -->
+    <div class="my-readings-card">
+      <div class="my-readings-title">📋 Meus dados enviados</div>
+      <div id="my-readings"><p class="no-data">Nenhum dado enviado ainda.</p></div>
+    </div>
+    <div style="background:var(--card);border-radius:var(--r);border:2px solid var(--border);
+      padding:14px;font-size:.78rem;color:var(--muted);line-height:1.8;">
+      <strong style="color:#92400e;">🎯 Dicas:</strong><br>
+      • Aponte a câmera <strong>traseira</strong> para a fonte de luz<br>
+      • Aguarde 2–3 seg para o valor estabilizar<br>
+      • Meça em locais diferentes para enriquecer a análise
+    </div>
+  </div>
+</div>
+
+<!-- ══ PROFESSOR ══ -->
+<div id="screen-professor" class="screen">
+  <div class="topbar" style="background:linear-gradient(90deg,#2563eb,#60a5fa);">
+    <button class="back" onclick="goHome()">← Sair</button>
+    👨‍🏫 Painel ao vivo
+    <span id="prof-session" class="stag">—</span>
+  </div>
+  <div class="prof-body">
+    <div class="label-row">
+      <input id="prof-label" placeholder="Contexto da sessão (ex: Ecologia de microhabitat)">
+      <button onclick="setLabel()">✔</button>
+    </div>
+    <div class="stat-row">
+      <div class="sbox"><div class="val" id="prof-n">0</div><div class="lbl">n</div></div>
+      <div class="sbox"><div class="val" id="prof-mean">—</div><div class="lbl">Média</div></div>
+      <div class="sbox"><div class="val" id="prof-median">—</div><div class="lbl">Mediana</div></div>
+      <div class="sbox"><div class="val" id="prof-sd">—</div><div class="lbl">DP</div></div>
+    </div>
+    <div class="chart-box"><canvas id="live-chart"></canvas></div>
+    <!-- ambientes -->
+    <div style="background:var(--card);border-radius:var(--r);border:2px solid var(--border);padding:12px;">
+      <div class="live-title">🌿 Ambientes registrados</div>
+      <div class="env-row" id="env-summary"></div>
+    </div>
+    <!-- lista com delete -->
+    <div class="live-box">
+      <div class="live-title">📡 Todos os dados (toque ✕ para apagar)</div>
+      <div id="live-list"></div>
+    </div>
+    <div class="act-row">
+      <button class="btn-analyze" onclick="goAnalysis()">📈 Analisar tudo</button>
+      <button class="btn-clear"   onclick="clearAll()">🗑 Limpar tudo</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ ANALYSIS ══ -->
+<div id="screen-analysis" class="screen">
+  <div class="topbar" style="background:linear-gradient(90deg,#7c3aed,#a78bfa);">
+    <button class="back" onclick="destroyCharts();show('screen-professor');">← Voltar</button>
+    📈 Análise Completa
+  </div>
+  <div class="ana-body">
+    <div class="sec">
+      <div class="sec-title">1 · Estatística Descritiva</div>
+      <table id="a-desc"></table>
+      <div class="ch"><canvas id="a-hist"></canvas></div>
+    </div>
+    <div class="sec">
+      <div class="sec-title">2 · Comparação de Ambientes 🌿</div>
+      <p style="font-size:.75rem;color:var(--muted);margin-bottom:10px">
+        Grupos = locais informados pelos alunos · Mann-Whitney (2 grupos) ou ANOVA (3+)
+      </p>
+      <div class="ch"><canvas id="a-scatter"></canvas></div>
+      <div style="margin-top:14px"><table id="a-test"></table></div>
+      <div class="ch"><canvas id="a-bar"></canvas></div>
+    </div>
+    <div class="sec">
+      <div class="sec-title">3 · Normalidade — Shapiro-Wilk + QQ-plot</div>
+      <table id="a-sw"></table>
+      <div class="ch"><canvas id="a-qq"></canvas></div>
+    </div>
+    <div class="sec">
+      <div class="sec-title">4 · Hipótese &amp; Correlação</div>
+      <table id="a-corr"></table>
+    </div>
+    <div class="sec">
+      <div class="sec-title">5 · Perfil Ecológico da Luz</div>
+      <div class="ch"><canvas id="a-eco"></canvas></div>
+      <div class="eco-ctx" id="eco-ctx"></div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
